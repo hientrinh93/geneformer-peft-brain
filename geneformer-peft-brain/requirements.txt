@@ -1,0 +1,13 @@
+torch
+transformers
+peft
+bitsandbytes
+accelerate
+scanpy
+anndata
+pandas
+numpy
+pyyaml
+datasets
+scikit-learn
+geneformer @ git+https://huggingface.co/ctheodoris/Geneformer
