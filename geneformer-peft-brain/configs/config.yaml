@@ -5,26 +5,69 @@ data:
   train_path: "data/brain_cellxgene_train.h5ad"
   val_path: "data/brain_cellxgene_validation.h5ad"
   test_path: "data/brain_cellxgene_test.h5ad"
-  label_column: "cell_type"          # Change to your actual label column name
+  label_column: "cell_type"
+  tokenizer_nproc: 4
+  # Set true to force re-tokenization even when cached data already exists
+  retokenize: false
+
+seed: 42   # global random seed for reproducibility (affects weight init, data shuffle, dropout)
 
 peft:
-  method: "qlora"                    # Options: qlora, lora, dora, pissa, olora
+  # Supported methods: lora | qlora | loftq | dora | pissa | olora | ia3
+  #   qlora  — 4-bit NF4 quantization + LoRA; best for low VRAM (<=16 GB)
+  #   loftq  — like qlora but initializes adapters via SVD to minimize quantization error;
+  #             converges faster, better accuracy when training budget is limited
+  #   dora   — weight-decomposed LoRA; closest to full fine-tuning behavior
+  #   pissa  — SVD-based init from W; fast convergence, good for small datasets
+  #   olora  — QR-based init; similar to pissa, slightly faster init
+  #   ia3    — fewest trainable params (scale vectors only); good for very small datasets
+  #
+  # To switch between qlora and loftq, change only this line — all flags are auto-derived.
+  method: "qlora"
+
   r: 16
   lora_alpha: 32
   lora_dropout: 0.05
-  target_modules: "all-linear"       # Recommended for Geneformer
-  use_dora: false
-  init_lora_weights: "pissa"         # "pissa", "olora", or null
+  # "all-linear" adapts every linear layer; use ["query","value"] for minimal footprint
+  target_modules: "all-linear"
+  # loftq only: SVD+quantize alternating rounds (1=fast, 4-8=more accurate init but slower)
+  loftq_iter: 1
+  # rsLoRA: scales adapter by alpha/sqrt(r) instead of alpha/r — stabilizes higher ranks
+  # Enable with r: 32 for best effect (Kalajdzievski 2023)
+  use_rslora: false
+  # Layer targeting: null = all layers; restrict to top layers to reduce params and overfitting
+  # Example for Geneformer 12-layer: [6, 7, 8, 9, 10, 11]
+  layers_to_transform: null
+  layers_pattern: "layer"
 
 training:
   per_device_train_batch_size: 8
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 4     # effective batch = 8 * 4 = 32
   learning_rate: 2e-4
   num_train_epochs: 4
   bf16: true
   gradient_checkpointing: true
   dataloader_num_workers: 4
   dataloader_pin_memory: true
+
+  max_grad_norm: 1.0                  # gradient clipping for training stability
+  warmup_ratio: 0.05                  # 5% of steps used for linear LR warm-up
+  lr_scheduler_type: "cosine"         # cosine decay after warm-up
+
+  # Upweight rare cell types in the cross-entropy loss to counter class imbalance
+  # (brain data from CellxGene is typically heavily skewed toward excitatory neurons)
+  class_weighted_loss: true
+
+  # Label smoothing: softens one-hot targets to reduce overconfidence on noisy CellxGene labels
+  # (Müller et al. 2019). 0.1 is a safe default for multi-class scRNA-seq annotation.
+  label_smoothing_factor: 0.1
+  # NEFTune: adds uniform noise to input embeddings during training (Jain et al. 2023)
+  # Improves robustness at zero accuracy cost; set to null to disable
+  neftune_noise_alpha: 5
+  # group_by_length: packs cells with similar gene-count lengths per batch to cut padding waste
+  # Requires "length" column in tokenized dataset (present in Geneformer output by default)
+  # Typically gives 1.5-2x throughput improvement with no accuracy cost
+  group_by_length: true
 
   save_steps: 200
   eval_steps: 200
