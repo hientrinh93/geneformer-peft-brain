@@ -1,0 +1,16 @@
+{
+  "_comment": "EXAMPLE template for hierarchical loss. Copy to coarse_map.json and replace keys with the EXACT fine cell-type names from your obs[label_column]. Every fine label must appear here, mapped to a coarse category name. Delete this _comment key in the real file.",
+  "L2/3 IT": "Excitatory neuron",
+  "L4 IT": "Excitatory neuron",
+  "L5 ET": "Excitatory neuron",
+  "L6 CT": "Excitatory neuron",
+  "Pvalb": "Inhibitory neuron",
+  "Sst": "Inhibitory neuron",
+  "Vip": "Inhibitory neuron",
+  "Lamp5": "Inhibitory neuron",
+  "Astrocyte": "Non-neuronal",
+  "Oligodendrocyte": "Non-neuronal",
+  "OPC": "Non-neuronal",
+  "Microglia": "Non-neuronal",
+  "Endothelial": "Non-neuronal"
+}

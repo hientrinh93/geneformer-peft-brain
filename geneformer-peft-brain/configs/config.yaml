@@ -1,26 +1,54 @@
-model_name: "ctheodoris/Geneformer"
+# V1-10M (6-layer, hidden 256, ~10M params) — fits RTX 2060 6GB comfortably and trains fast.
+# The HF repo root is the 316M V2 model, which is far too slow on a 6GB GPU (~100s/step).
+# This local path is the cloned Geneformer-V1-10M subfolder; pairs with model_version: V1.
+model_name: "C:/Users/hient/OneDrive_mindx/OneDrive/Documents/scRNAseq/geneformer-peft-brain/Geneformer_src/Geneformer-V1-10M"
 output_dir: "./results/geneformer_peft_brain"
 
+# Geneformer architecture version. This is NOT a pure drop-in switch — V2 changes both
+# the model weights AND the tokenizer, so the two must stay in sync (handled automatically
+# from this single knob).
+#   "V1" — original 6/12-layer model, context length 2048, no special tokens
+#   "V2" — newer model, context length 4096, uses <cls>/<eos> special tokens; higher accuracy
+# To use V2 you must ALSO point model_name at a V2 checkpoint, e.g. one of the subfolders
+# in the ctheodoris/Geneformer repo: "ctheodoris/Geneformer/Geneformer-V2-104M".
+# Requires a geneformer package version that ships the V2 dictionaries (verify on install).
+model_version: "V1"
+
 data:
-  train_path: "data/brain_cellxgene_train.h5ad"
-  val_path: "data/brain_cellxgene_validation.h5ad"
-  test_path: "data/brain_cellxgene_test.h5ad"
+  train_path: "data/cxg_train.h5ad"
+  val_path: "data/cxg_validation.h5ad"
+  test_path: "data/cxg_test.h5ad"
   label_column: "cell_type"
-  tokenizer_nproc: 4
+  # Used by src.check_splits to verify no donor leaks across train/val/test.
+  # CellxGene files usually call this "donor_id"; change if your obs uses another name.
+  donor_column: "donor_id"
+  tokenizer_nproc: 1   # 1 on Windows (multiprocessing in TranscriptomeTokenizer can hang)
   # Set true to force re-tokenization even when cached data already exists
   retokenize: false
+  # Newer Geneformer requires Ensembl IDs in var['ensembl_id']. If your var has them in a
+  # different column, name it here; null = use var.index (CellxGene stores ENSG... in the index).
+  ensembl_id_column: null
+  # Remove cells whose cell type has fewer than this many cells in a split.
+  # Prevents unreliably-trained classes and avoids extreme loss weights.
+  # Set to 0 to disable filtering entirely.
+  min_cells_per_class: 50
 
 seed: 42   # global random seed for reproducibility (affects weight init, data shuffle, dropout)
 
 peft:
-  # Supported methods: lora | qlora | loftq | dora | pissa | olora | ia3
-  #   qlora  — 4-bit NF4 quantization + LoRA; best for low VRAM (<=16 GB)
-  #   loftq  — like qlora but initializes adapters via SVD to minimize quantization error;
+  # Supported methods: lora | qlora | qdora | loftq | dora | pissa | olora | ia3 | adalora
+  #   qdora   — DoRA on a 4-bit-quantized base: weight-decomposed LoRA + QLoRA memory savings.
+  #             Best accuracy/VRAM trade-off; slower per step than qlora.
+  #   qlora   — 4-bit NF4 quantization + LoRA; best for low VRAM (<=16 GB)
+  #   loftq   — like qlora but initializes adapters via SVD to minimize quantization error;
   #             converges faster, better accuracy when training budget is limited
-  #   dora   — weight-decomposed LoRA; closest to full fine-tuning behavior
-  #   pissa  — SVD-based init from W; fast convergence, good for small datasets
-  #   olora  — QR-based init; similar to pissa, slightly faster init
-  #   ia3    — fewest trainable params (scale vectors only); good for very small datasets
+  #   dora    — weight-decomposed LoRA; closest to full fine-tuning behavior
+  #   pissa   — SVD-based init from W; fast convergence, good for small datasets
+  #   olora   — QR-based init; similar to pissa, slightly faster init
+  #   ia3     — fewest trainable params (scale vectors only); good for very small datasets
+  #   adalora — dynamically prunes rank during training to concentrate budget on the most
+  #             important layers; `r` becomes the TARGET average rank (see adalora_* below).
+  #             Note: ignores class_weighted_loss (uses its own regularised loss).
   #
   # To switch between qlora and loftq, change only this line — all flags are auto-derived.
   method: "qlora"
@@ -40,12 +68,26 @@ peft:
   layers_to_transform: null
   layers_pattern: "layer"
 
+  # --- AdaLoRA only (method: "adalora") ---
+  # `r` above is the TARGET average rank. Adapters start at adalora_init_r and are pruned
+  # down to an average of `r` as training progresses. total_step is computed automatically.
+  adalora_init_r: null          # null → auto = round(r * 1.5); higher start = more to prune
+  adalora_tinit: null           # null → auto = 10% of total_step (warm-up, no pruning)
+  adalora_tfinal: null          # null → auto = 15% of total_step (freeze mask near the end)
+  adalora_deltaT: 10            # optimizer steps between rank reallocations
+  adalora_orth_reg_weight: 0.5  # strength of orthogonality penalty on singular vectors
+
 training:
   per_device_train_batch_size: 8
   gradient_accumulation_steps: 4     # effective batch = 8 * 4 = 32
-  learning_rate: 2e-4
-  num_train_epochs: 4
-  bf16: true
+  learning_rate: 2.0e-4   # must be 2.0e-4 not 2e-4 — YAML parses 2e-4 as a STRING, not a float
+  num_train_epochs: 1   # smoke test: 1 epoch. Raise for real runs.
+  # max_steps > 0 caps training at that many optimizer steps (overrides epochs) — used here
+  # for a fast workflow smoke test. Set to -1 to disable and train the full num_train_epochs.
+  max_steps: 150
+  # RTX 2060 is Turing (no bf16). Use fp16. On Ampere+ (RTX 30xx/40xx, A100) prefer bf16: true.
+  bf16: false
+  fp16: true
   gradient_checkpointing: true
   dataloader_num_workers: 4
   dataloader_pin_memory: true
@@ -57,6 +99,10 @@ training:
   # Upweight rare cell types in the cross-entropy loss to counter class imbalance
   # (brain data from CellxGene is typically heavily skewed toward excitatory neurons)
   class_weighted_loss: true
+  # Softens the raw "balanced" class weights by raising them to this power.
+  # 1.0 = raw balanced (can give 20x+ range); 0.5 = sqrt (gentler); 0.0 = uniform.
+  # 0.5 is recommended: keeps minority-class preference without destabilising training.
+  class_weight_power: 0.5
 
   # Label smoothing: softens one-hot targets to reduce overconfidence on noisy CellxGene labels
   # (Müller et al. 2019). 0.1 is a safe default for multi-class scRNA-seq annotation.
@@ -69,11 +115,49 @@ training:
   # Typically gives 1.5-2x throughput improvement with no accuracy cost
   group_by_length: true
 
-  save_steps: 200
-  eval_steps: 200
-  logging_steps: 50
+  # Fit calibration on the validation set after training (Guo et al. 2017) and save it to
+  # calibration.json. Inference applies it to logits before softmax → calibrated confidence
+  # scores. Does not change predictions/accuracy. Set false to skip.
+  calibrate_temperature: true
+  # calibration_method: "temperature" = single global scalar T (robust, 1 param);
+  #                     "vector" = per-class scale+bias (fixes classes that are individually
+  #                     over/under-confident; more params, needs a decent-sized val set).
+  calibration_method: "temperature"
+
+  # Hierarchical loss: adds lambda * coarse-level cross-entropy on top of the fine-grained
+  # loss, so confusing cell types across BROAD categories (e.g. neuron vs glia) is penalised
+  # more than confusing siblings within a category. Requires a coarse_map_path JSON mapping
+  # each fine cell-type name → a coarse category name.
+  # Ignored for method: adalora (which needs its own built-in loss).
+  hierarchical_loss: false
+  hierarchical_lambda: 0.3
+  coarse_map_path: "configs/coarse_map.json"
+  # hierarchical_mode: "marginalize" = coarse probs from fine softmax (zero extra params);
+  #                    "learned_head" = separate Linear(hidden->coarse) on the CLS rep, trained
+  #                    jointly as an auxiliary task (more capacity; head not saved, train-only).
+  hierarchical_mode: "marginalize"
+
+  # Pre-train guard: verify no donor leaks across train/val/test before training starts.
+  # Aborts on leakage; warns (continues) if the donor column is missing.
+  # NOTE: this dataset has only ~3-4 donors that overlap across splits (confirmed leakage),
+  # so a clean donor split is impossible without new data. Guard is disabled to allow the
+  # pipeline to run, but test metrics on these splits do NOT measure generalisation to new
+  # donors — treat them as pipeline-validation only. Run `python -m src.check_splits` to see.
+  check_splits_before_train: false
+
+  save_steps: 50
+  eval_steps: 50
+  logging_steps: 10
+
+  # Resume training from a checkpoint.
+  # Options:
+  #   null          → start from scratch (default)
+  #   true          → auto-detect latest checkpoint in output_dir
+  #   "./results/geneformer_peft_brain/checkpoint-400"  → specific checkpoint path
+  resume_from_checkpoint: null
 
 wandb:
-  enabled: true
+  # Disabled for local runs to avoid a login prompt. Set true (and run `wandb login`) to track.
+  enabled: false
   project: "geneformer-peft-brain"
   run_name: "qlora-brain-run-1"

@@ -10,4 +10,6 @@ numpy
 pyyaml
 datasets
 scikit-learn
+h5py
+wandb
 geneformer @ git+https://huggingface.co/ctheodoris/Geneformer

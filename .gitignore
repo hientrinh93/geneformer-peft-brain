@@ -1,0 +1,21 @@
+# Large data and model artifacts — never commit (GitHub 100 MB file limit)
+**/data/
+**/results/
+**/data/tokenized/
+**/data/filtered/
+Geneformer_src/
+*.h5ad
+*.dataset/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+
+# Misc
+*.log
+.DS_Store

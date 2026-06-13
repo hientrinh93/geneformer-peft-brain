@@ -1,5 +1,7 @@
 import json
+import math
 import os
+import pickle
 from pathlib import Path
 
 import numpy as np
@@ -13,12 +15,26 @@ from sklearn.metrics import (
     recall_score,
 )
 from sklearn.utils.class_weight import compute_class_weight
-from transformers import EarlyStoppingCallback, Trainer, TrainingArguments, set_seed
+from transformers import (
+    EarlyStoppingCallback,
+    Trainer,
+    TrainerCallback,
+    TrainingArguments,
+    set_seed,
+)
 
-from geneformer import BertForSequenceClassification, DataCollatorForCellClassification
+from transformers import BertForSequenceClassification
+from geneformer import (
+    DataCollatorForCellClassification,
+    TOKEN_DICTIONARY_FILE,
+    TOKEN_DICTIONARY_FILE_30M,
+)
+from src.calibration import fit_and_save_calibration
+from src.check_splits import check_donor_leakage
 from src.data_processing import load_and_tokenize_data
-from src.model_peft import get_bnb_config, needs_quantization, prepare_model
+from src.model_peft import get_bnb_config, get_compute_dtype, needs_quantization, prepare_model
 from src.utils import (
+    build_coarse_mapping,
     get_label_mapping_from_h5ad,
     load_config,
     save_per_class_metrics,
@@ -41,29 +57,94 @@ def compute_metrics(eval_pred):
     }
 
 
-def build_weighted_trainer_class(class_weights: torch.Tensor):
+def build_custom_trainer_class(
+    class_weights=None,
+    fine_to_coarse=None,
+    agg_matrix=None,
+    coarse_head=None,
+    hier_lambda: float = 0.0,
+):
     """
-    Factory returning a Trainer subclass with class-weighted cross-entropy loss.
+    Factory returning a Trainer subclass with a custom loss supporting two optional terms:
 
-    label_smoothing_factor is explicitly threaded through from self.args so it
-    applies even when compute_loss is overridden.  The default Trainer applies
-    smoothing inside its own compute_loss; overriding that method without
-    forwarding the arg silently drops label smoothing.
+    1. Class-weighted cross-entropy (class_weights not None) — upweights rare cell types.
+    2. Hierarchical loss (fine_to_coarse not None) — adds lambda * coarse-level CE so that
+       confusing cell types across DIFFERENT broad categories is penalised more than confusing
+       siblings within one category. Two ways to produce coarse logits:
+         - marginalise (coarse_head is None): p_coarse = p_fine @ agg_matrix. Zero extra
+           params; coarse prediction is fully determined by the fine head.
+         - learned head (coarse_head given): a separate Linear(hidden_size -> n_coarse) reads
+           the CLS representation directly. More capacity — the coarse task can shape the shared
+           encoder features independently of the fine head, which often regularises better.
+
+    label_smoothing_factor is threaded through from self.args so it still applies even though
+    compute_loss is overridden (the default Trainer applies smoothing in its own compute_loss).
     """
-    class WeightedTrainer(Trainer):
+    class CustomTrainer(Trainer):
         def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
             labels = inputs.pop("labels")
-            outputs = model(**inputs)
-            weights = class_weights.to(outputs.logits.device)
+            # The learned coarse head needs the encoder's hidden states; request them only then
+            # to avoid the extra memory when marginalising.
+            need_hidden = coarse_head is not None
+            outputs = (
+                model(**inputs, output_hidden_states=True) if need_hidden else model(**inputs)
+            )
+            logits = outputs.logits
+
+            weights = class_weights.to(logits.device) if class_weights is not None else None
             loss = F.cross_entropy(
-                outputs.logits,
+                logits,
                 labels,
                 weight=weights,
                 label_smoothing=self.args.label_smoothing_factor,
             )
+
+            if fine_to_coarse is not None:
+                coarse_target = fine_to_coarse.to(logits.device)[labels]
+                if coarse_head is not None:
+                    # CLS token of the last hidden layer is Bert's sequence representation
+                    pooled = outputs.hidden_states[-1][:, 0]
+                    coarse_logits = coarse_head(pooled)
+                    coarse_loss = F.cross_entropy(coarse_logits, coarse_target)
+                else:
+                    p_coarse = F.softmax(logits, dim=-1) @ agg_matrix.to(logits.device)
+                    # epsilon before log avoids -inf when a coarse prob underflows to 0
+                    coarse_loss = F.nll_loss(torch.log(p_coarse + 1e-12), coarse_target)
+                loss = loss + hier_lambda * coarse_loss
+
             return (loss, outputs) if return_outputs else loss
 
-    return WeightedTrainer
+    return CustomTrainer
+
+
+class AdaLoRACallback(TrainerCallback):
+    """
+    Drives AdaLoRA's dynamic rank reallocation during training.
+
+    AdaLoRA must call model.update_and_allocate(global_step) once per optimizer step,
+    AFTER gradients are computed but BEFORE they are zeroed — it reads .grad to estimate
+    each singular value's importance, then prunes the budget accordingly.
+
+    on_pre_optimizer_step fires at exactly that moment and once per optimizer step (so it
+    respects gradient_accumulation_steps).  It requires transformers >= 4.42; on older
+    versions this hook is never called and AdaLoRA silently degrades to a fixed-rank
+    adapter — the assertion below makes that failure loud instead of silent.
+    """
+
+    def __init__(self, model):
+        self.model = model
+        self._fired = False
+
+    def on_pre_optimizer_step(self, args, state, control, **kwargs):
+        self._fired = True
+        self.model.update_and_allocate(state.global_step)
+
+    def on_train_end(self, args, state, control, **kwargs):
+        assert self._fired, (
+            "AdaLoRACallback.on_pre_optimizer_step never fired — your transformers "
+            "version likely predates 4.42. AdaLoRA rank reallocation did NOT run. "
+            "Upgrade transformers or switch peft.method to 'lora'."
+        )
 
 
 def main():
@@ -77,6 +158,21 @@ def main():
         os.environ["WANDB_PROJECT"] = config["wandb"]["project"]
 
     save_training_config(config)
+
+    # Pre-train guard: refuse to train on donor-leaking splits (metrics would be invalid).
+    # check_donor_leakage returns n_leaks (>0 = leakage) or -1 (donor column missing).
+    if config["training"].get("check_splits_before_train", True):
+        n_leaks = check_donor_leakage(config)
+        if n_leaks > 0:
+            raise SystemExit(
+                f"Aborting: {n_leaks} donor(s) leak across splits — fix the split or set "
+                "training.check_splits_before_train: false to override (not recommended)."
+            )
+        if n_leaks < 0:
+            print(
+                "WARNING: could not verify donor splits (donor column missing). "
+                "Proceeding, but metrics may be invalid if splits share donors."
+            )
 
     label2id, id2label = get_label_mapping_from_h5ad(
         config["data"]["train_path"], config["data"]["label_column"]
@@ -95,7 +191,21 @@ def main():
     print(f"Label map saved to {label_map_path}")
 
     print("Loading and tokenizing datasets...")
-    train_dataset, val_dataset, test_dataset = load_and_tokenize_data(config)
+    train_dataset, val_dataset, test_dataset = load_and_tokenize_data(config, label2id)
+
+    # AdaLoRA needs the total number of OPTIMIZER steps up front so its budget scheduler
+    # knows the horizon for tinit/tfinal/deltaT. Compute it from the train set size here
+    # (before prepare_model builds the AdaLoraConfig) and inject it into the peft config.
+    is_adalora = config["peft"]["method"] == "adalora"
+    if is_adalora:
+        eff_batch = (
+            config["training"]["per_device_train_batch_size"]
+            * config["training"]["gradient_accumulation_steps"]
+        )
+        steps_per_epoch = math.ceil(len(train_dataset) / eff_batch)
+        total_step = steps_per_epoch * config["training"]["num_train_epochs"]
+        config["peft"]["adalora_total_step"] = total_step
+        print(f"AdaLoRA: computed total_step = {total_step} ({steps_per_epoch} steps/epoch)")
 
     load_kwargs = dict(
         num_labels=num_labels,
@@ -104,21 +214,48 @@ def main():
         label2id=label2id,
     )
     if needs_quantization(config):
-        load_kwargs["quantization_config"] = get_bnb_config()
+        load_kwargs["quantization_config"] = get_bnb_config(get_compute_dtype(config))
         print("Loading model with 4-bit NF4 quantization (QLoRA)...")
 
     model = BertForSequenceClassification.from_pretrained(config["model_name"], **load_kwargs)
+    # Capture hidden size before PEFT wrapping for the optional learned coarse head
+    hidden_size = model.config.hidden_size
 
     print(f"Applying PEFT method: {config['peft']['method']}")
     model = prepare_model(model, config)
     # PEFT's built-in method reports accurate trainable counts for quantized layers
     model.print_trainable_parameters()
 
+    # Custom-loss terms (class weighting, hierarchical loss) both override compute_loss and
+    # pop labels, which would drop AdaLoRA's built-in orthogonal-regularisation term (it is
+    # added inside AdaLoraModel.forward only when the model computes the loss itself).
+    # So both terms are mutually exclusive with AdaLoRA — AdaLoRA uses its own regularised loss.
+    want_weighted = config["training"].get("class_weighted_loss", False)
+    want_hier = config["training"].get("hierarchical_loss", False)
+    if is_adalora and (want_weighted or want_hier):
+        print(
+            "NOTE: class_weighted_loss / hierarchical_loss are ignored for AdaLoRA — its "
+            "orthogonal regularisation requires the model's built-in loss."
+        )
+        want_weighted = want_hier = False
+
     TrainerClass = Trainer
-    if config["training"].get("class_weighted_loss", False):
+    class_weights = None
+    agg_matrix = fine_to_coarse = coarse_head = None
+    hier_lambda = 0.0
+
+    if want_weighted:
         raw_labels = np.array(train_dataset.dataset["label"])
         present_classes = np.unique(raw_labels)
         weights_present = compute_class_weight("balanced", classes=present_classes, y=raw_labels)
+
+        # Soften raw "balanced" weights with a power < 1 to avoid extreme penalisation
+        # of majority classes.  Raw balanced weights = n_total / (n_classes * n_i), which
+        # can give excitatory neurons a weight of ~0.1 and rare types ~20x.  Raising to
+        # weight_power (default 0.5 = sqrt) compresses the range while keeping the
+        # minority-class preference.  Set weight_power=1.0 in config to restore raw behavior.
+        weight_power = config["training"].get("class_weight_power", 0.5)
+        weights_present = weights_present ** weight_power
 
         # Build a full num_labels-length weight vector indexed by label code.
         # If a class exists in val/test but not in train, compute_class_weight returns
@@ -127,20 +264,50 @@ def main():
         for cls, wt in zip(present_classes, weights_present):
             full_weights[int(cls)] = wt
         class_weights = torch.tensor(full_weights, dtype=torch.float32)
-
-        TrainerClass = build_weighted_trainer_class(class_weights)
         print(
             f"Class-weighted loss enabled — {len(present_classes)}/{num_labels} classes "
-            f"present in train split"
+            f"present in train split (weight_power={weight_power})"
+        )
+
+    if want_hier:
+        coarse_map_path = config["training"]["coarse_map_path"]
+        hier_lambda = config["training"].get("hierarchical_lambda", 0.3)
+        hier_mode = config["training"].get("hierarchical_mode", "marginalize")
+        fine_to_coarse, agg_matrix, coarse2id = build_coarse_mapping(label2id, coarse_map_path)
+        if hier_mode == "learned_head":
+            # Attach the head to the model so its params land in model.parameters() and are
+            # picked up by the Trainer's optimizer (new modules default to requires_grad=True).
+            # It's an auxiliary training-only head — not needed at inference, so it is not saved.
+            coarse_head = torch.nn.Linear(hidden_size, len(coarse2id))
+            model.coarse_head = coarse_head
+            print(
+                f"Hierarchical loss enabled — mode=learned_head, lambda={hier_lambda}, "
+                f"head={hidden_size}->{len(coarse2id)}"
+            )
+        else:
+            print(f"Hierarchical loss enabled — mode=marginalize, lambda={hier_lambda}")
+
+    if want_weighted or want_hier:
+        TrainerClass = build_custom_trainer_class(
+            class_weights=class_weights,
+            fine_to_coarse=fine_to_coarse,
+            agg_matrix=agg_matrix,
+            coarse_head=coarse_head,
+            hier_lambda=hier_lambda,
         )
 
     training_args = TrainingArguments(
         output_dir=config["output_dir"],
         per_device_train_batch_size=config["training"]["per_device_train_batch_size"],
         gradient_accumulation_steps=config["training"]["gradient_accumulation_steps"],
-        learning_rate=config["training"]["learning_rate"],
+        # float() guards the YAML scientific-notation gotcha (2e-4 parses as a str, not float)
+        learning_rate=float(config["training"]["learning_rate"]),
         num_train_epochs=config["training"]["num_train_epochs"],
-        bf16=config["training"]["bf16"],
+        # max_steps > 0 caps training (overrides epochs); -1 disables. Used for quick smoke tests.
+        max_steps=config["training"].get("max_steps", -1),
+        bf16=config["training"].get("bf16", False),
+        # fp16 for Turing/older GPUs (e.g. RTX 2060) that lack bf16 support
+        fp16=config["training"].get("fp16", False),
         gradient_checkpointing=config["training"].get("gradient_checkpointing", False),
         gradient_checkpointing_kwargs={"use_reentrant": False},
         max_grad_norm=config["training"].get("max_grad_norm", 1.0),
@@ -165,9 +332,10 @@ def main():
         metric_for_best_model="f1_macro",
         greater_is_better=True,
         label_names=["labels"],
-        # Pass seed explicitly so Trainer's dataloader shuffle matches config seed
+        # Pass seed explicitly so Trainer's dataloader shuffle matches config seed.
+        # (data_seed is intentionally omitted — it requires accelerate >= 1.1.0, which drops
+        # Python 3.8 support; `seed` alone already seeds the dataloader sampler.)
         seed=config.get("seed", 42),
-        data_seed=config.get("seed", 42),
         report_to="wandb" if config.get("wandb", {}).get("enabled", False) else "none",
         run_name=config.get("wandb", {}).get("run_name"),
         # save_total_limit must be >= early_stopping_patience + 1 so the best
@@ -175,23 +343,54 @@ def main():
         save_total_limit=7,
     )
 
+    callbacks = [EarlyStoppingCallback(
+        early_stopping_patience=6,
+        # require at least 0.01% improvement to reset patience counter;
+        # prevents premature stopping on noisy eval fluctuations
+        early_stopping_threshold=1e-4,
+    )]
+    if is_adalora:
+        # Must reference the actual PEFT model so update_and_allocate hits the AdaLoRA layers
+        callbacks.append(AdaLoRACallback(model))
+
+    # Newer Geneformer's collator requires the token dictionary (for pad-token handling).
+    # Must match the model_version used for tokenization (V1 -> gc30M vocab, V2 -> gc104M).
+    tok_dict_file = (
+        TOKEN_DICTIONARY_FILE_30M if config.get("model_version", "V1") == "V1"
+        else TOKEN_DICTIONARY_FILE
+    )
+    with open(tok_dict_file, "rb") as f:
+        token_dictionary = pickle.load(f)
+
     trainer = TrainerClass(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         compute_metrics=compute_metrics,
-        data_collator=DataCollatorForCellClassification(),
-        callbacks=[EarlyStoppingCallback(
-            early_stopping_patience=6,
-            # require at least 0.01% improvement to reset patience counter;
-            # prevents premature stopping on noisy eval fluctuations
-            early_stopping_threshold=1e-4,
-        )],
+        data_collator=DataCollatorForCellClassification(token_dictionary=token_dictionary),
+        callbacks=callbacks,
     )
 
     print("Starting training...")
-    trainer.train()
+    resume_from = config["training"].get("resume_from_checkpoint", None)
+    if resume_from:
+        # resume_from_checkpoint can be:
+        #   True  → Trainer auto-detects the latest checkpoint in output_dir
+        #   str   → explicit path to a specific checkpoint folder
+        print(f"Resuming from checkpoint: {resume_from}")
+    trainer.train(resume_from_checkpoint=resume_from or False)
+
+    # Fit temperature on the VALIDATION set (not test) so inference confidence is calibrated.
+    # Done after load_best_model_at_end so we calibrate the model that will actually be saved.
+    if config["training"].get("calibrate_temperature", True):
+        # calibration_method: "temperature" (single scalar) | "vector" (per-class scale+bias)
+        calib_method = config["training"].get("calibration_method", "temperature")
+        print(f"Fitting calibration ({calib_method}) on validation set...")
+        val_output = trainer.predict(val_dataset)
+        fit_and_save_calibration(
+            val_output.predictions, val_output.label_ids, config["output_dir"], calib_method
+        )
 
     if test_dataset is not None:
         print("Evaluating on test set...")
